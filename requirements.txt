@@ -1,0 +1,23 @@
+# Core dependencies for Danish to English translation
+transformers>=4.55.0
+torch>=2.8.0
+accelerate>=1.10.0
+safetensors>=0.6.2
+tokenizers>=0.21.4
+
+# GPU support (optional)
+bitsandbytes>=0.46.1
+
+# Text processing
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
+regex>=2025.7.34
+
+# Utilities
+numpy>=2.3.2
+tqdm>=4.67.1
+requests>=2.32.4
+huggingface-hub>=0.34.4
+
+# Optional: for better performance
+psutil>=7.0.0
