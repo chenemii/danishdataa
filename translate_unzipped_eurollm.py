@@ -19,7 +19,8 @@ except Exception:  # optional offline deps
     BitsAndBytesConfig = None
 
 
-HF_MODEL = os.environ.get("HF_MODEL", "Helsinki-NLP/opus-mt-da-en")
+HF_MODEL_SMALL = os.environ.get("HF_MODEL_SMALL", "Helsinki-NLP/opus-mt-da-en")
+HF_MODEL_LARGE = os.environ.get("HF_MODEL_LARGE", "eurollm/eurollm-7b")
 
 
 def is_probably_danish(text: str) -> bool:
@@ -108,7 +109,16 @@ def _build_instruction(text: str) -> str:
     )
 
 
-# Removed remote HF Inference API usage; using local Transformers pipeline instead
+def estimate_token_count(text: str, tokenizer) -> int:
+    """
+    Estimate the number of tokens in the text using the tokenizer.
+    """
+    try:
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        return len(tokens)
+    except Exception:
+        # Fallback: rough estimate based on character count
+        return len(text) // 4  # Rough approximation: 4 chars per token
 
 
 @dataclass
@@ -378,7 +388,199 @@ def iter_csv_rows(path: str) -> Tuple[List[str], Iterable[List[str]]]:
         return header, reader
 
 
-def process_csv(in_path: str, out_path: str, target_fields: List[str], rate_limit_s: float, *, translator: LocalTranslator) -> None:
+def separate_rows_by_length(rows: List[List[str]], target_indices: List[int], 
+                           small_translator: LocalTranslator, max_tokens: int = 512) -> Tuple[List[List[str]], List[List[str]]]:
+    """
+    Separate rows into small and large based on estimated token count.
+    Returns (small_rows, large_rows) where small_rows can be handled by the small model.
+    """
+    small_rows = []
+    large_rows = []
+    
+    for row in rows:
+        # Make sure row has at least header length (malformed rows will be padded)
+        if len(row) < len(target_indices):
+            row = row + [""] * (len(target_indices) - len(row))
+        
+        # Check if any target field exceeds the token limit
+        needs_large_model = False
+        for idx in target_indices:
+            if idx < len(row):
+                text = row[idx]
+                if text and text.strip():
+                    token_count = estimate_token_count(text, small_translator.tokenizer)
+                    if token_count > max_tokens:
+                        needs_large_model = True
+                        break
+        
+        if needs_large_model:
+            large_rows.append(row)
+        else:
+            small_rows.append(row)
+    
+    return small_rows, large_rows
+
+
+def process_csv_phase1_local(in_path: str, out_path: str, large_csv_path: str, target_fields: List[str], 
+                           rate_limit_s: float, max_tokens: int, *, translator: LocalTranslator) -> None:
+    """
+    Phase 1: Process CSV locally with small model.
+    - Translate short texts and save to output CSV
+    - Save long texts to separate CSV for processing on another machine
+    """
+    print(f"  Processing CSV (Phase 1 - Local): {os.path.basename(in_path)}")
+    
+    with open(in_path, "r", encoding="utf-8", newline="") as fin, \
+         open(out_path, "w", encoding="utf-8", newline="") as fout, \
+         open(large_csv_path, "w", encoding="utf-8", newline="") as flarge:
+        
+        reader = csv.reader(
+            fin,
+            delimiter=",",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+            strict=True,
+        )
+        writer = csv.writer(
+            fout,
+            delimiter=",",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+            lineterminator="\n",
+        )
+        large_writer = csv.writer(
+            flarge,
+            delimiter=",",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+            lineterminator="\n",
+        )
+
+        try:
+            header = next(reader)
+        except StopIteration:
+            print(f"  ⚠ Empty CSV file: {in_path}")
+            return
+
+        # Write headers to both files
+        writer.writerow(header)
+        large_writer.writerow(header)
+        
+        name_to_idx = {name: i for i, name in enumerate(header)}
+
+        missing = [name for name in target_fields if name not in name_to_idx]
+        if missing:
+            print(f"  ⚠ Warning: {in_path} missing columns: {missing}")
+
+        target_indices = [name_to_idx[name] for name in target_fields if name in name_to_idx]
+        
+        # Count total rows for progress
+        rows = list(reader)
+        total_rows = len(rows)
+        print(f"  📊 Found {total_rows} rows to process")
+        
+        if total_rows == 0:
+            print(f"  ✅ No data rows found in {in_path}")
+            return
+
+        # Separate rows into small and large based on token count
+        print(f"  🔍 Separating rows by token count...")
+        small_rows, large_rows = separate_rows_by_length(rows, target_indices, translator, max_tokens)
+        
+        print(f"  📊 Row separation results:")
+        print(f"    - Small rows (≤{max_tokens} tokens): {len(small_rows)}")
+        print(f"    - Large rows (>{max_tokens} tokens): {len(large_rows)}")
+        
+        # Process small rows with local model
+        if small_rows:
+            print(f"  🚀 Processing small rows with local model...")
+            process_rows_with_translator(small_rows, target_indices, translator, "local")
+            
+            # Write small rows to output file
+            for row in small_rows:
+                writer.writerow(row)
+        
+        # Write large rows to separate CSV for processing on another machine
+        if large_rows:
+            print(f"  📁 Saving {len(large_rows)} large rows to: {os.path.basename(large_csv_path)}")
+            for row in large_rows:
+                large_writer.writerow(row)
+        
+        print(f"  ✅ Phase 1 completed:")
+        print(f"    - Translated {len(small_rows)} rows locally")
+        print(f"    - Saved {len(large_rows)} rows to {os.path.basename(large_csv_path)} for remote processing")
+
+
+def process_csv_phase2_remote(in_path: str, out_path: str, target_fields: List[str], 
+                            rate_limit_s: float, *, translator: LocalTranslator) -> None:
+    """
+    Phase 2: Process CSV with large model (run on machine with large model).
+    This processes only the rows that were too long for the small model.
+    """
+    print(f"  Processing CSV (Phase 2 - Remote): {os.path.basename(in_path)}")
+    
+    with open(in_path, "r", encoding="utf-8", newline="") as fin, \
+         open(out_path, "w", encoding="utf-8", newline="") as fout:
+        
+        reader = csv.reader(
+            fin,
+            delimiter=",",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+            strict=True,
+        )
+        writer = csv.writer(
+            fout,
+            delimiter=",",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+            lineterminator="\n",
+        )
+
+        try:
+            header = next(reader)
+        except StopIteration:
+            print(f"  ⚠ Empty CSV file: {in_path}")
+            return
+
+        writer.writerow(header)
+        name_to_idx = {name: i for i, name in enumerate(header)}
+
+        missing = [name for name in target_fields if name not in name_to_idx]
+        if missing:
+            print(f"  ⚠ Warning: {in_path} missing columns: {missing}")
+
+        target_indices = [name_to_idx[name] for name in target_fields if name in name_to_idx]
+        
+        # Count total rows for progress
+        rows = list(reader)
+        total_rows = len(rows)
+        print(f"  📊 Found {total_rows} large rows to process with remote model")
+        
+        if total_rows == 0:
+            print(f"  ✅ No data rows found in {in_path}")
+            return
+
+        # Process all rows with large model (they were already filtered to be large)
+        print(f"  🚀 Processing all rows with large model...")
+        process_rows_with_translator(rows, target_indices, translator, "remote")
+        
+        # Write all processed rows
+        for i, row in enumerate(rows):
+            # Show progress every 10 rows or at the end
+            if i % 10 == 0 or i == total_rows - 1:
+                print(f"  📝 Writing row {i+1}/{total_rows} ({(i+1)*100//total_rows}%)")
+            writer.writerow(row)
+            if rate_limit_s > 0:
+                time.sleep(rate_limit_s)
+        
+        print(f"  ✅ Phase 2 completed: processed {total_rows} large rows")
+
+
+def process_csv_with_model_separation(in_path: str, out_path: str, target_fields: List[str], 
+                                    rate_limit_s: float, max_tokens: int, *, small_translator: LocalTranslator, 
+                                    large_translator: LocalTranslator = None) -> None:
+    """Legacy function for single-machine processing"""
     print(f"  Processing CSV: {os.path.basename(in_path)}")
     
     with open(in_path, "r", encoding="utf-8", newline="") as fin, open(out_path, "w", encoding="utf-8", newline="") as fout:
@@ -421,37 +623,34 @@ def process_csv(in_path: str, out_path: str, target_fields: List[str], rate_limi
             print(f"  ✅ No data rows found in {in_path}")
             return
 
-        # Collect all texts that need translation for batch processing
-        texts_to_translate = []
-        translation_indices = []  # (row_idx, field_idx) pairs
+        # Separate rows into small and large based on token count
+        print(f"  🔍 Separating rows by token count...")
+        small_rows, large_rows = separate_rows_by_length(rows, target_indices, small_translator, max_tokens)
         
-        for i, row in enumerate(rows):
-            # Make sure row has at least header length (malformed rows will be padded)
-            if len(row) < len(header):
-                row = row + [""] * (len(header) - len(row))
-            
-            for idx in target_indices:
-                original = row[idx]
-                if original and original.strip():  # Only translate non-empty fields
-                    texts_to_translate.append(original)
-                    translation_indices.append((i, idx))
+        print(f"  📊 Row separation results:")
+        print(f"    - Small rows (≤{max_tokens} tokens): {len(small_rows)}")
+        print(f"    - Large rows (>{max_tokens} tokens): {len(large_rows)}")
         
-        print(f"  🔄 Found {len(texts_to_translate)} fields to translate")
+        # Process small rows with small model
+        if small_rows:
+            print(f"  🚀 Processing small rows with small model...")
+            process_rows_with_translator(small_rows, target_indices, small_translator, "small")
         
-        # Batch translate all texts
-        if texts_to_translate:
-            print(f"  🚀 Starting batch translation...")
-            translated_texts = translator.translate_batch(texts_to_translate)
-            print(f"  ✅ Batch translation completed")
-            
-            # Apply translations back to rows
-            for (row_idx, field_idx), translated_text in zip(translation_indices, translated_texts):
-                if translated_text:  # Only update if translation succeeded
-                    rows[row_idx][field_idx] = translated_text
-                    print(f"    🔄 Translated field (row {row_idx+1}, field {field_idx})")
+        # Process large rows with large model (if available)
+        if large_rows:
+            if large_translator:
+                print(f"  🚀 Processing large rows with large model...")
+                process_rows_with_translator(large_rows, target_indices, large_translator, "large")
+            else:
+                print(f"  ⚠ No large model available, skipping {len(large_rows)} large rows")
+                # Keep original text for large rows if no large model
+                pass
+        
+        # Combine all rows back in original order
+        all_processed_rows = small_rows + large_rows
         
         # Write all rows
-        for i, row in enumerate(rows):
+        for i, row in enumerate(all_processed_rows):
             # Show progress every 10 rows or at the end
             if i % 10 == 0 or i == total_rows - 1:
                 print(f"  📝 Writing row {i+1}/{total_rows} ({(i+1)*100//total_rows}%)")
@@ -460,6 +659,45 @@ def process_csv(in_path: str, out_path: str, target_fields: List[str], rate_limi
                 time.sleep(rate_limit_s)
         
         print(f"  ✅ Completed processing {total_rows} rows")
+
+
+def process_rows_with_translator(rows: List[List[str]], target_indices: List[int], 
+                               translator: LocalTranslator, model_type: str) -> None:
+    """Process a batch of rows with the specified translator"""
+    if not rows:
+        return
+    
+    # Collect all texts that need translation for batch processing
+    texts_to_translate = []
+    translation_indices = []  # (row_idx, field_idx) pairs
+    
+    for i, row in enumerate(rows):
+        for idx in target_indices:
+            if idx < len(row):
+                original = row[idx]
+                if original and original.strip():  # Only translate non-empty fields
+                    texts_to_translate.append(original)
+                    translation_indices.append((i, idx))
+    
+    print(f"    🔄 Found {len(texts_to_translate)} fields to translate with {model_type} model")
+    
+    # Batch translate all texts
+    if texts_to_translate:
+        print(f"    🚀 Starting batch translation with {model_type} model...")
+        translated_texts = translator.translate_batch(texts_to_translate)
+        print(f"    ✅ Batch translation completed with {model_type} model")
+        
+        # Apply translations back to rows
+        for (row_idx, field_idx), translated_text in zip(translation_indices, translated_texts):
+            if translated_text:  # Only update if translation succeeded
+                rows[row_idx][field_idx] = translated_text
+                print(f"      🔄 Translated field (row {row_idx+1}, field {field_idx}) with {model_type} model")
+
+
+def process_csv(in_path: str, out_path: str, target_fields: List[str], rate_limit_s: float, *, translator: LocalTranslator) -> None:
+    """Legacy function for backward compatibility"""
+    process_csv_with_model_separation(in_path, out_path, target_fields, rate_limit_s, 512,
+                                    small_translator=translator, large_translator=None)
 
 
 def find_csv_files(root: str) -> List[str]:
@@ -475,16 +713,26 @@ def find_csv_files(root: str) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate Danish parts of job description fields to English using a local Transformers pipeline (Helsinki-NLP/opus-mt-da-en by default).")
+    parser = argparse.ArgumentParser(description="Translate Danish parts of job description fields to English using local Transformers pipelines with two-phase processing support.")
     parser.add_argument("--root", default="/c/denmark/unzipped", help="Root folder to scan for CSV files (recursively)")
     parser.add_argument("--fields", nargs="*", default=["BODY", "TITLE_RAW"], help="CSV columns to process")
     parser.add_argument("--out-suffix", default=".en", help="Suffix to add before .csv for output files")
     parser.add_argument("--rate-limit", type=float, default=0.0, help="Sleep seconds after each field translation (to avoid rate limits)")
-    parser.add_argument("--model", default=HF_MODEL, help="Model ID or local directory")
+    parser.add_argument("--model-small", default=HF_MODEL_SMALL, help="Small model ID for texts ≤512 tokens")
+    parser.add_argument("--model-large", default=HF_MODEL_LARGE, help="Large model ID for texts >512 tokens (default: eurollm/eurollm-7b)")
     parser.add_argument("--device-map", default="auto", help='Device map for local model (e.g., "auto", "cpu", "cuda")')
     parser.add_argument("--load-in-4bit", action="store_true", help="Load model in 4-bit (requires bitsandbytes + CUDA)")
     parser.add_argument("--torch-dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"], help="Torch dtype for local model")
     parser.add_argument("--local-files-only", action="store_true", help="Transformers should only use local files (no network)")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Maximum tokens for small model (default: 512)")
+    
+    # Two-phase processing options
+    parser.add_argument("--phase", choices=["1", "2", "both"], default="both", 
+                       help="Processing phase: 1=local only, 2=remote only, both=single machine")
+    parser.add_argument("--large-csv-suffix", default=".large", 
+                       help="Suffix for CSV containing large rows (Phase 1)")
+    parser.add_argument("--remote-input", help="Input CSV for Phase 2 (remote processing)")
+    
     args = parser.parse_args()
 
     csv_files = find_csv_files(args.root)
@@ -494,28 +742,100 @@ def main():
 
     print(f"Found {len(csv_files)} CSV file(s) under {args.root}")
 
-    cfg = LocalGenConfig(
-        model_id=args.model,
-        device_map=args.device_map,
-        load_in_4bit=args.load_in_4bit,
-        local_files_only=args.local_files_only,
-        torch_dtype=args.torch_dtype,
-    )
-    translator = LocalTranslator(cfg)
-
-    for i, in_path in enumerate(csv_files):
-        base, ext = os.path.splitext(in_path)
+    if args.phase == "2":
+        # Phase 2: Remote processing only
+        if not args.remote_input:
+            print("❌ Error: --remote-input is required for Phase 2")
+            return 1
+        
+        print(f"🔄 Loading large model for remote processing: {args.model_large}")
+        cfg_large = LocalGenConfig(
+            model_id=args.model_large,
+            device_map=args.device_map,
+            load_in_4bit=args.load_in_4bit,
+            local_files_only=args.local_files_only,
+            torch_dtype=args.torch_dtype,
+        )
+        large_translator = LocalTranslator(cfg_large)
+        
+        base, ext = os.path.splitext(args.remote_input)
         out_path = base + args.out_suffix + ext
-        print(f"\n🔄 [{i+1}/{len(csv_files)}] Processing: {os.path.basename(in_path)}")
-        print(f"   📁 Input:  {in_path}")
+        
+        print(f"\n🔄 Processing remote CSV: {os.path.basename(args.remote_input)}")
+        print(f"   📁 Input:  {args.remote_input}")
         print(f"   📁 Output: {out_path}")
+        
         try:
-            process_csv(in_path, out_path, args.fields, args.rate_limit, translator=translator)
-            print(f"   ✅ Successfully processed: {os.path.basename(in_path)}")
+            process_csv_phase2_remote(args.remote_input, out_path, args.fields, args.rate_limit, 
+                                   translator=large_translator)
+            print(f"   ✅ Successfully processed: {os.path.basename(args.remote_input)}")
         except Exception as e:
-            print(f"   ❌ Error processing {os.path.basename(in_path)}: {e}")
+            print(f"   ❌ Error processing {os.path.basename(args.remote_input)}: {e}")
+            return 1
+        
+    else:
+        # Phase 1 or both: Local processing
+        print(f"🔄 Loading small model for local processing: {args.model_small}")
+        cfg_small = LocalGenConfig(
+            model_id=args.model_small,
+            device_map=args.device_map,
+            load_in_4bit=args.load_in_4bit,
+            local_files_only=args.local_files_only,
+            torch_dtype=args.torch_dtype,
+        )
+        small_translator = LocalTranslator(cfg_small)
+
+        if args.phase == "both":
+            # Single machine processing with both models
+            large_translator = None
+            if args.model_large != args.model_small:
+                print(f"🔄 Loading large model: {args.model_large}")
+                cfg_large = LocalGenConfig(
+                    model_id=args.model_large,
+                    device_map=args.device_map,
+                    load_in_4bit=args.load_in_4bit,
+                    local_files_only=args.local_files_only,
+                    torch_dtype=args.torch_dtype,
+                )
+                large_translator = LocalTranslator(cfg_large)
+            else:
+                print(f"ℹ️ Using same model for both small and large texts: {args.model_small}")
+                large_translator = small_translator
+
+            for i, in_path in enumerate(csv_files):
+                base, ext = os.path.splitext(in_path)
+                out_path = base + args.out_suffix + ext
+                print(f"\n🔄 [{i+1}/{len(csv_files)}] Processing: {os.path.basename(in_path)}")
+                print(f"   📁 Input:  {in_path}")
+                print(f"   📁 Output: {out_path}")
+                try:
+                    process_csv_with_model_separation(in_path, out_path, args.fields, args.rate_limit, args.max_tokens,
+                                                   small_translator=small_translator, 
+                                                   large_translator=large_translator)
+                    print(f"   ✅ Successfully processed: {os.path.basename(in_path)}")
+                except Exception as e:
+                    print(f"   ❌ Error processing {os.path.basename(in_path)}: {e}")
+        
+        else:
+            # Phase 1: Local processing only
+            for i, in_path in enumerate(csv_files):
+                base, ext = os.path.splitext(in_path)
+                out_path = base + args.out_suffix + ext
+                large_csv_path = base + args.large_csv_suffix + ext
+                
+                print(f"\n🔄 [{i+1}/{len(csv_files)}] Processing (Phase 1): {os.path.basename(in_path)}")
+                print(f"   📁 Input:  {in_path}")
+                print(f"   📁 Output: {out_path}")
+                print(f"   📁 Large:  {large_csv_path}")
+                
+                try:
+                    process_csv_phase1_local(in_path, out_path, large_csv_path, args.fields, args.rate_limit, args.max_tokens,
+                                          translator=small_translator)
+                    print(f"   ✅ Successfully processed: {os.path.basename(in_path)}")
+                except Exception as e:
+                    print(f"   ❌ Error processing {os.path.basename(in_path)}: {e}")
     
-    print(f"\n🎉 All done! Processed {len(csv_files)} CSV files.")
+    print(f"\n🎉 All done!")
     return 0
 
 

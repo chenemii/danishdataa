@@ -236,3 +236,5 @@ For issues or questions:
 ## License
 
 This project is for educational and research purposes. Please respect the terms of use for the Danish job data source.
+
+
