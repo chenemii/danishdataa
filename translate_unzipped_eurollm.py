@@ -11,12 +11,17 @@ from dataclasses import dataclass
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, pipeline
     from transformers import BitsAndBytesConfig  # type: ignore
+    try:
+        from datasets import Dataset
+    except ImportError:
+        Dataset = None
 except Exception:  # optional offline deps
     AutoTokenizer = None
     AutoModelForCausalLM = None
     AutoModelForSeq2SeqLM = None
     pipeline = None
     BitsAndBytesConfig = None
+    Dataset = None
 
 
 HF_MODEL_SMALL = os.environ.get("HF_MODEL_SMALL", "Helsinki-NLP/opus-mt-da-en")
@@ -150,6 +155,15 @@ class LocalGenConfig:
 
 
 class LocalTranslator:
+    def _is_causal_lm_model(self, model_id: str) -> bool:
+        """Detect if this is a causal LM model based on the model name"""
+        causal_lm_patterns = [
+            "llama", "mistral", "gpt", "falcon", "bloom", "opt", "eurollm",
+            "codellama", "vicuna", "alpaca", "wizard", "orca"
+        ]
+        model_lower = model_id.lower()
+        return any(pattern in model_lower for pattern in causal_lm_patterns)
+    
     def __init__(self, cfg: LocalGenConfig) -> None:
         if AutoTokenizer is None or AutoModelForCausalLM is None or pipeline is None:
             raise RuntimeError("Transformers not available. Please install: pip install -U transformers accelerate safetensors")
@@ -176,7 +190,7 @@ class LocalTranslator:
             model_kwargs["torch_dtype"] = dtype_map.get(cfg.torch_dtype, torch.float32)
 
         # Load model with GPU optimization
-        # Use Helsinki-NLP/opus-mt-da-en for reliable Danish to English translation
+        # Detect model type based on model name/config
         
         # Set up GPU-optimized loading
         import torch
@@ -191,16 +205,28 @@ class LocalTranslator:
             print("Loading model on CPU")
             model_kwargs_gpu = {}
         
+        # Determine if this is a causal LM (like Llama/EuroLLM) or seq2seq model
+        self.is_causal_lm = self._is_causal_lm_model(cfg.model_id)
+        print(f"Detected model type: {'Causal LM' if self.is_causal_lm else 'Seq2Seq'}")
+        
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 cfg.model_id,
                 local_files_only=cfg.local_files_only,
             )
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                cfg.model_id,
-                local_files_only=cfg.local_files_only,
-                **model_kwargs_gpu,
-            )
+            
+            if self.is_causal_lm:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    cfg.model_id,
+                    local_files_only=cfg.local_files_only,
+                    **model_kwargs_gpu,
+                )
+            else:
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                    cfg.model_id,
+                    local_files_only=cfg.local_files_only,
+                    **model_kwargs_gpu,
+                )
         except Exception as load_err:
             if cfg.local_files_only:
                 print(
@@ -211,11 +237,19 @@ class LocalTranslator:
                     cfg.model_id,
                     local_files_only=False,
                 )
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                    cfg.model_id,
-                    local_files_only=False,
-                    **model_kwargs_gpu,
-                )
+                
+                if self.is_causal_lm:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        cfg.model_id,
+                        local_files_only=False,
+                        **model_kwargs_gpu,
+                    )
+                else:
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                        cfg.model_id,
+                        local_files_only=False,
+                        **model_kwargs_gpu,
+                    )
             else:
                 raise load_err
         
@@ -229,14 +263,58 @@ class LocalTranslator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
-        # Create pipeline with device handling
+        # Create pipeline with device handling based on model type
         try:
-            if cfg.device_map.startswith("cuda"):
+            if self.is_causal_lm:
+                # For causal LMs, use text-generation pipeline
+                if cfg.device_map.startswith("cuda"):
+                    self.pipe = pipeline(
+                        task="text-generation",
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        device=cfg.device_map,
+                        max_new_tokens=512,
+                        do_sample=False,
+                        temperature=0.1,
+                    )
+                else:
+                    self.pipe = pipeline(
+                        task="text-generation",
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        device=-1,  # CPU
+                        max_new_tokens=512,
+                        do_sample=False,
+                        temperature=0.1,
+                    )
+            else:
+                # For seq2seq models, use translation pipeline
+                if cfg.device_map.startswith("cuda"):
+                    self.pipe = pipeline(
+                        task="translation_da_to_en",
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        device=cfg.device_map,
+                    )
+                else:
+                    self.pipe = pipeline(
+                        task="translation_da_to_en",
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        device=-1,  # CPU
+                    )
+        except Exception as e:
+            print(f"Pipeline creation error: {e}")
+            # Fallback to CPU if GPU fails
+            if self.is_causal_lm:
                 self.pipe = pipeline(
-                    task="translation_da_to_en",
+                    task="text-generation",
                     model=self.model,
                     tokenizer=self.tokenizer,
-                    device=cfg.device_map,
+                    device=-1,  # CPU
+                    max_new_tokens=512,
+                    do_sample=False,
+                    temperature=0.1,
                 )
             else:
                 self.pipe = pipeline(
@@ -245,106 +323,307 @@ class LocalTranslator:
                     tokenizer=self.tokenizer,
                     device=-1,  # CPU
                 )
-        except Exception as e:
-            print(f"Pipeline creation error: {e}")
-            # Fallback to CPU if GPU fails
-            self.pipe = pipeline(
-                task="translation_da_to_en",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=-1,  # CPU
-            )
         
         # Set environment variable to help with CUDA debugging
         import os
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        
+        # Calculate optimal batch sizes based on GPU memory
+        self._calculate_optimal_batch_sizes()
+
+    def _calculate_optimal_batch_sizes(self):
+        """Calculate optimal batch sizes based on available GPU memory"""
+        try:
+            import torch
+            if torch.cuda.is_available() and hasattr(self, 'model') and self.model.device.type == 'cuda':
+                # Get GPU memory info
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                gpu_memory_gb = gpu_memory / (1024**3)
+                
+                if self.is_causal_lm:
+                    # Causal LMs need more memory per sample
+                    if gpu_memory_gb >= 24:  # High-end GPU
+                        self.optimal_batch_size = 16
+                    elif gpu_memory_gb >= 12:  # Mid-range GPU
+                        self.optimal_batch_size = 8
+                    elif gpu_memory_gb >= 8:  # Lower-end GPU
+                        self.optimal_batch_size = 4
+                    else:  # Very limited memory
+                        self.optimal_batch_size = 2
+                else:
+                    # Seq2seq models are more memory efficient
+                    if gpu_memory_gb >= 24:  # High-end GPU
+                        self.optimal_batch_size = 32
+                    elif gpu_memory_gb >= 12:  # Mid-range GPU
+                        self.optimal_batch_size = 16
+                    elif gpu_memory_gb >= 8:  # Lower-end GPU
+                        self.optimal_batch_size = 8
+                    else:  # Very limited memory
+                        self.optimal_batch_size = 4
+                
+                print(f"  🔧 Optimal batch size for {gpu_memory_gb:.1f}GB GPU: {self.optimal_batch_size}")
+            else:
+                # CPU fallback
+                self.optimal_batch_size = 4 if self.is_causal_lm else 8
+                print(f"  🔧 CPU batch size: {self.optimal_batch_size}")
+                
+        except Exception as e:
+            print(f"  ⚠ Could not calculate optimal batch size: {e}")
+            self.optimal_batch_size = 4 if self.is_causal_lm else 8
+
+    def _extract_translation_from_generated(self, generated_text: str, instruction: str) -> str:
+        """Extract the translation from the generated text by the causal LM"""
+        try:
+            # Remove the original instruction from the generated text
+            if instruction in generated_text:
+                result = generated_text.replace(instruction, "").strip()
+            else:
+                result = generated_text.strip()
+            
+            # If the model added extra text, try to find the actual translation
+            # Look for the text after </TEXT> or just take everything after the instruction
+            if "</TEXT>" in result:
+                parts = result.split("</TEXT>", 1)
+                if len(parts) > 1:
+                    result = parts[1].strip()
+            
+            # Remove common model artifacts
+            result = result.replace("Translation:", "").replace("English translation:", "").strip()
+            
+            # If the result is empty or very short, return the original text
+            if not result or len(result) < 3:
+                # Try to extract from the original instruction
+                text_start = instruction.find("<TEXT>\n") + 7
+                text_end = instruction.find("\n</TEXT>")
+                if text_start > 6 and text_end > text_start:
+                    return instruction[text_start:text_end]
+                else:
+                    return generated_text.strip()
+            
+            return result
+        except Exception:
+            # Fallback: return the original generated text
+            return generated_text.strip()
 
     def translate(self, text: str) -> str:
         try:
             # Clean input text
             text = text.replace('\x00', '').replace('\ufffd', '')
             
-            # Handle long texts by chunking them
-            max_length = 400  # Conservative max length for the model
-            if len(text) > max_length:
-                # Split into chunks and translate each
-                chunks = [text[i:i+max_length] for i in range(0, len(text), max_length)]
-                translated_chunks = []
-                for j, chunk in enumerate(chunks):
-                    try:
-                        outputs = self.pipe(chunk, max_length=max_length)
-                        if isinstance(outputs, list) and outputs:
-                            translated = outputs[0].get("translation_text", "")
-                            translated_chunks.append(str(translated).strip())
-                        else:
+            if self.is_causal_lm:
+                # For causal LMs, we need to use instruction-based prompting
+                instruction = _build_instruction(text)
+                
+                # Handle long texts by chunking them
+                max_input_length = 1000  # Conservative max length for causal LMs
+                if len(instruction) > max_input_length:
+                    # For very long texts, chunk the original text, not the instruction
+                    chunks = [text[i:i+max_input_length//2] for i in range(0, len(text), max_input_length//2)]
+                    translated_chunks = []
+                    for j, chunk in enumerate(chunks):
+                        try:
+                            chunk_instruction = _build_instruction(chunk)
+                            outputs = self.pipe(chunk_instruction, max_new_tokens=512, do_sample=False, temperature=0.1)
+                            if isinstance(outputs, list) and outputs:
+                                generated_text = outputs[0].get("generated_text", "")
+                                # Extract the translation from the generated text
+                                translated = self._extract_translation_from_generated(generated_text, chunk_instruction)
+                                translated_chunks.append(str(translated).strip())
+                            else:
+                                translated_chunks.append(chunk)  # Keep original if translation fails
+                        except Exception as chunk_error:
+                            print(f"      Chunk {j+1}/{len(chunks)} translation error: {chunk_error}")
                             translated_chunks.append(chunk)  # Keep original if translation fails
-                    except Exception as chunk_error:
-                        print(f"      Chunk {j+1}/{len(chunks)} translation error: {chunk_error}")
-                        translated_chunks.append(chunk)  # Keep original if translation fails
-                return " ".join(translated_chunks)
+                    return " ".join(translated_chunks)
+                else:
+                    outputs = self.pipe(instruction, max_new_tokens=512, do_sample=False, temperature=0.1)
+                    if isinstance(outputs, list) and outputs:
+                        generated_text = outputs[0].get("generated_text", "")
+                        # Extract the translation from the generated text
+                        translated = self._extract_translation_from_generated(generated_text, instruction)
+                        return str(translated).strip()
+                    return ""
             else:
-                outputs = self.pipe(text, max_length=max_length)
-                if isinstance(outputs, list) and outputs:
-                    translated = outputs[0].get("translation_text", "")
-                    return str(translated).strip()
-                return ""
+                # For seq2seq models, use the original translation logic
+                max_length = 400  # Conservative max length for the model
+                if len(text) > max_length:
+                    # Split into chunks and translate each
+                    chunks = [text[i:i+max_length] for i in range(0, len(text), max_length)]
+                    translated_chunks = []
+                    for j, chunk in enumerate(chunks):
+                        try:
+                            outputs = self.pipe(chunk, max_length=max_length)
+                            if isinstance(outputs, list) and outputs:
+                                translated = outputs[0].get("translation_text", "")
+                                translated_chunks.append(str(translated).strip())
+                            else:
+                                translated_chunks.append(chunk)  # Keep original if translation fails
+                        except Exception as chunk_error:
+                            print(f"      Chunk {j+1}/{len(chunks)} translation error: {chunk_error}")
+                            translated_chunks.append(chunk)  # Keep original if translation fails
+                    return " ".join(translated_chunks)
+                else:
+                    outputs = self.pipe(text, max_length=max_length)
+                    if isinstance(outputs, list) and outputs:
+                        translated = outputs[0].get("translation_text", "")
+                        return str(translated).strip()
+                    return ""
         except Exception as e:
             print(f"      Translation error: {e}")
             return text  # Return original text on error
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """Translate multiple texts efficiently using batch processing"""
+        """Translate multiple texts efficiently using dataset-based batch processing"""
         if not texts:
             return []
         
         try:
-            # Process in batches for better GPU efficiency
-            batch_size = 4  # Reduced batch size to avoid CUDA errors
-            results = []
+            # Clean and preprocess all texts
+            cleaned_texts = []
+            for text in texts:
+                cleaned = text.replace('\x00', '').replace('\ufffd', '')
+                # Limit length to avoid CUDA errors
+                if len(cleaned) > 500:
+                    cleaned = cleaned[:500]
+                cleaned_texts.append(cleaned)
             
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                try:
-                    # Clean and validate input texts
-                    cleaned_batch = []
-                    for text in batch:
-                        # Remove or replace problematic characters
-                        cleaned = text.replace('\x00', '').replace('\ufffd', '')
-                        # Limit length to avoid CUDA errors
-                        if len(cleaned) > 500:
-                            cleaned = cleaned[:500]
-                        cleaned_batch.append(cleaned)
-                    
-                    outputs = self.pipe(cleaned_batch, max_length=400, batch_size=len(cleaned_batch))
-                    if isinstance(outputs, list):
-                        for output in outputs:
-                            if isinstance(output, dict) and "translation_text" in output:
-                                results.append(str(output["translation_text"]).strip())
-                            else:
-                                results.append("")  # Fallback for failed translations
-                    else:
-                        results.extend([""] * len(cleaned_batch))
-                except Exception as batch_error:
-                    print(f"      Batch translation error: {batch_error}")
-                    # Fallback to individual translation for this batch
-                    for text in batch:
-                        try:
-                            cleaned = text.replace('\x00', '').replace('\ufffd', '')
-                            if len(cleaned) > 500:
-                                cleaned = cleaned[:500]
-                            output = self.pipe(cleaned, max_length=400)
-                            if isinstance(output, list) and output and isinstance(output[0], dict):
-                                results.append(str(output[0].get("translation_text", "")).strip())
-                            else:
-                                results.append("")
-                        except Exception as single_error:
-                            print(f"      Single translation error: {single_error}")
-                            results.append("")
-            
-            return results
+            if self.is_causal_lm:
+                # For causal LMs, we need dataset-based batching with instructions
+                return self._translate_batch_causal_lm(cleaned_texts)
+            else:
+                # For seq2seq models, use optimized dataset-based batching
+                return self._translate_batch_seq2seq(cleaned_texts)
+                
         except Exception as e:
             print(f"      Batch translation error: {e}")
             return [text for text in texts]  # Return original texts on error
+
+    def _translate_batch_causal_lm(self, texts: List[str]) -> List[str]:
+        """Optimized batch processing for causal language models using datasets"""
+        if Dataset is None:
+            print("      Dataset not available, falling back to sequential processing")
+            return self._translate_batch_sequential(texts)
+        
+        try:
+            # Prepare instructions for all texts
+            instructions = [_build_instruction(text) for text in texts]
+            
+            # Create dataset for efficient batching
+            dataset = Dataset.from_dict({"text": instructions, "original": texts})
+            
+            # Use pipeline with dataset for optimized GPU batching
+            # The pipeline will automatically handle batching efficiently
+            batch_size = min(self.optimal_batch_size, len(texts))  # Use calculated optimal batch size
+            results = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch_instructions = instructions[i:i + batch_size]
+                batch_originals = texts[i:i + batch_size]
+                
+                try:
+                    # Process batch with optimized pipeline
+                    outputs = self.pipe(
+                        batch_instructions, 
+                        max_new_tokens=512, 
+                        do_sample=False, 
+                        temperature=0.1,
+                        batch_size=batch_size,
+                        return_full_text=False
+                    )
+                    
+                    if isinstance(outputs, list):
+                        for j, output in enumerate(outputs):
+                            if isinstance(output, dict) and "generated_text" in output:
+                                generated_text = output["generated_text"]
+                                # Extract translation from generated text
+                                translated = self._extract_translation_from_generated(
+                                    generated_text, batch_instructions[j]
+                                )
+                                results.append(str(translated).strip())
+                            else:
+                                results.append(batch_originals[j])  # Fallback
+                    else:
+                        results.extend(batch_originals)  # Fallback
+                        
+                except Exception as batch_error:
+                    print(f"      Causal LM batch error: {batch_error}")
+                    # Fallback to individual processing for this batch
+                    for text in batch_originals:
+                        try:
+                            translated = self.translate(text)
+                            results.append(translated)
+                        except Exception:
+                            results.append(text)
+            
+            return results
+            
+        except Exception as e:
+            print(f"      Causal LM batch processing error: {e}")
+            return self._translate_batch_sequential(texts)
+
+    def _translate_batch_seq2seq(self, texts: List[str]) -> List[str]:
+        """Optimized batch processing for seq2seq models using datasets"""
+        if Dataset is None:
+            print("      Dataset not available, falling back to sequential processing")
+            return self._translate_batch_sequential(texts)
+        
+        try:
+            # Create dataset for efficient batching
+            dataset = Dataset.from_dict({"text": texts})
+            
+            # Use pipeline with dataset for optimized GPU batching
+            # This uses the recommended approach for GPU efficiency
+            batch_size = min(self.optimal_batch_size, len(texts))  # Use calculated optimal batch size
+            
+            # Process using dataset with pipeline - this is the recommended approach
+            def process_batch(examples):
+                try:
+                    outputs = self.pipe(
+                        examples["text"], 
+                        max_length=400,
+                        batch_size=batch_size
+                    )
+                    
+                    if isinstance(outputs, list):
+                        translations = []
+                        for output in outputs:
+                            if isinstance(output, dict) and "translation_text" in output:
+                                translations.append(str(output["translation_text"]).strip())
+                            else:
+                                translations.append("")  # Fallback for failed translations
+                        return {"translations": translations}
+                    else:
+                        return {"translations": [""] * len(examples["text"])}
+                        
+                except Exception as e:
+                    print(f"      Seq2seq batch processing error: {e}")
+                    return {"translations": examples["text"]}  # Return original texts
+            
+            # Process dataset in batches
+            results = []
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                batch_dict = {"text": batch_texts}
+                batch_results = process_batch(batch_dict)
+                results.extend(batch_results["translations"])
+            
+            return results
+            
+        except Exception as e:
+            print(f"      Seq2seq batch processing error: {e}")
+            return self._translate_batch_sequential(texts)
+
+    def _translate_batch_sequential(self, texts: List[str]) -> List[str]:
+        """Fallback sequential processing when dataset batching is not available"""
+        results = []
+        for text in texts:
+            try:
+                translated = self.translate(text)
+                results.append(translated)
+            except Exception as single_error:
+                print(f"      Single translation error: {single_error}")
+                results.append(text)  # Return original text on error
+        return results
 
 
 def translate_mixed_text(text: str, *, translator: LocalTranslator) -> str:
@@ -708,8 +987,58 @@ def find_csv_files(root: str) -> List[str]:
                 continue
             if fn.startswith("._"):
                 continue  # skip macOS metadata files
+            
+            # Skip files that are output or intermediate files from previous processing
+            fn_lower = fn.lower()
+            name_without_ext = fn_lower.replace('.csv', '')
+            
+            # Check if the filename contains processing suffixes
+            skip_patterns = ['en', 'small', 'large']
+            should_skip = False
+            
+            for pattern in skip_patterns:
+                # Check if pattern appears as a suffix (with or without dots)
+                if (name_without_ext.endswith('.' + pattern) or 
+                    name_without_ext.endswith('_' + pattern) or
+                    ('.' + pattern + '.') in fn_lower or
+                    ('_' + pattern + '_') in fn_lower or
+                    # Also check for direct matches like "test_EN.csv"
+                    name_without_ext.endswith(pattern)):
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue  # skip processed output files and intermediate files
+            
             csvs.append(os.path.join(dirpath, fn))
     return csvs
+
+
+def is_output_complete(input_path: str, output_path: str) -> bool:
+    """
+    Check if the output CSV exists and has the same number of rows as the input CSV.
+    Returns True if output is complete, False otherwise.
+    """
+    if not os.path.exists(output_path):
+        return False
+    
+    try:
+        # Count rows in input file
+        with open(input_path, "r", encoding="utf-8", newline="") as f:
+            input_reader = csv.reader(f, delimiter=",", quoting=csv.QUOTE_NONE, escapechar="\\")
+            input_rows = sum(1 for _ in input_reader)
+        
+        # Count rows in output file
+        with open(output_path, "r", encoding="utf-8", newline="") as f:
+            output_reader = csv.reader(f, delimiter=",", quoting=csv.QUOTE_NONE, escapechar="\\")
+            output_rows = sum(1 for _ in output_reader)
+        
+        # Output should have the same number of rows as input (including header)
+        return input_rows == output_rows and output_rows > 0
+    
+    except Exception as e:
+        print(f"  ⚠ Error checking output completeness for {output_path}: {e}")
+        return False
 
 
 def main():
@@ -732,6 +1061,8 @@ def main():
     parser.add_argument("--large-csv-suffix", default=".large", 
                        help="Suffix for CSV containing large rows (Phase 1)")
     parser.add_argument("--remote-input", help="Input CSV for Phase 2 (remote processing)")
+    parser.add_argument("--resume", action="store_true", 
+                       help="Skip processing files that already have complete output (resume mode)")
     
     args = parser.parse_args()
 
@@ -765,13 +1096,17 @@ def main():
         print(f"   📁 Input:  {args.remote_input}")
         print(f"   📁 Output: {out_path}")
         
-        try:
-            process_csv_phase2_remote(args.remote_input, out_path, args.fields, args.rate_limit, 
-                                   translator=large_translator)
-            print(f"   ✅ Successfully processed: {os.path.basename(args.remote_input)}")
-        except Exception as e:
-            print(f"   ❌ Error processing {os.path.basename(args.remote_input)}: {e}")
-            return 1
+        # Check if resume mode is enabled and output is already complete
+        if args.resume and is_output_complete(args.remote_input, out_path):
+            print(f"   ⏭️ Skipping (already complete): {os.path.basename(args.remote_input)}")
+        else:
+            try:
+                process_csv_phase2_remote(args.remote_input, out_path, args.fields, args.rate_limit, 
+                                       translator=large_translator)
+                print(f"   ✅ Successfully processed: {os.path.basename(args.remote_input)}")
+            except Exception as e:
+                print(f"   ❌ Error processing {os.path.basename(args.remote_input)}: {e}")
+                return 1
         
     else:
         # Phase 1 or both: Local processing
@@ -808,6 +1143,12 @@ def main():
                 print(f"\n🔄 [{i+1}/{len(csv_files)}] Processing: {os.path.basename(in_path)}")
                 print(f"   📁 Input:  {in_path}")
                 print(f"   📁 Output: {out_path}")
+                
+                # Check if resume mode is enabled and output is already complete
+                if args.resume and is_output_complete(in_path, out_path):
+                    print(f"   ⏭️ Skipping (already complete): {os.path.basename(in_path)}")
+                    continue
+                
                 try:
                     process_csv_with_model_separation(in_path, out_path, args.fields, args.rate_limit, args.max_tokens,
                                                    small_translator=small_translator, 
@@ -827,6 +1168,18 @@ def main():
                 print(f"   📁 Input:  {in_path}")
                 print(f"   📁 Output: {out_path}")
                 print(f"   📁 Large:  {large_csv_path}")
+                
+                # Check if resume mode is enabled and both outputs are already complete
+                if args.resume:
+                    output_complete = is_output_complete(in_path, out_path)
+                    large_complete = is_output_complete(in_path, large_csv_path)
+                    if output_complete and large_complete:
+                        print(f"   ⏭️ Skipping (already complete): {os.path.basename(in_path)}")
+                        continue
+                    elif output_complete:
+                        print(f"   ⏭️ Skipping main output (already complete), large CSV may be updated")
+                    elif large_complete:
+                        print(f"   ⏭️ Large CSV already complete, main output may be updated")
                 
                 try:
                     process_csv_phase1_local(in_path, out_path, large_csv_path, args.fields, args.rate_limit, args.max_tokens,
