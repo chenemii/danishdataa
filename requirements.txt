@@ -5,6 +5,7 @@ accelerate>=1.10.0
 safetensors>=0.6.2
 tokenizers>=0.21.4
 protobuf
+datasets
 
 # GPU support (optional)
 bitsandbytes>=0.46.1
